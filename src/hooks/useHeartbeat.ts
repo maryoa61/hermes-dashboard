@@ -1,171 +1,80 @@
-import { useEffect, useRef, useState } from 'react';
-import { HealthState, HermesServerProfile } from '../types/hermes';
-import { checkAuth, checkHealth } from '../utils/hermesClient';
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import {defineConfig} from 'vite';
+import {VitePWA} from 'vite-plugin-pwa';
 
-export function useHeartbeat(
-  profile: HermesServerProfile | null,
-  baseIntervalSec: number = 20
-) {
-  const [healthState, setHealthState] = useState<HealthState>({
-    state: profile ? 'reconnecting' : 'unconfigured',
-    lastChecked: null,
-    latencyMs: null,
-  });
+// Deploy base path. '/' for Cloudflare Pages / Netlify / custom domain,
+// '/hermes-dashboard/' for GitHub Pages (set by the workflow via BASE_PATH).
+const rawBase = process.env.BASE_PATH || '/';
+const base = rawBase.endsWith('/') ? rawBase : `${rawBase}/`;
 
-  const failureCountRef = useRef(0);
-  const authCounterRef = useRef(0);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isRunningRef = useRef(false);
-
-  const performCheck = async () => {
-    if (isRunningRef.current) return;
-    if (!profile) {
-      setHealthState({
-        state: 'unconfigured',
-        lastChecked: null,
-        latencyMs: null,
-      });
-      return;
-    }
-
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      setHealthState((prev) => ({
-        ...prev,
-        state: 'offline',
-        errorDetail: 'Browser is offline',
-      }));
-      scheduleNext(baseIntervalSec);
-      return;
-    }
-
-    if (document.hidden) {
-      // Paused while hidden
-      return;
-    }
-
-    isRunningRef.current = true;
-    try {
-      const result = await checkHealth(profile);
-
-      if (result.ok) {
-        failureCountRef.current = 0;
-
-        // /health is public: verify the API key on the first success and then
-        // every 6th check (~2 min at the default 20 s interval)
-        let nextState: 'connected' | 'auth_error' = 'connected';
-        let authDetail: string | undefined;
-        if (authCounterRef.current % 6 === 0) {
-          const auth = await checkAuth(profile);
-          if (!auth.authOk && (auth.status === 401 || auth.status === 403)) {
-            nextState = 'auth_error';
-            authDetail = auth.errorDetail;
-          }
-        }
-        authCounterRef.current += 1;
-
-        setHealthState({
-          state: nextState,
-          lastChecked: Date.now(),
-          latencyMs: result.latencyMs,
-          httpStatus: result.status,
-          errorDetail: authDetail,
-        });
-        scheduleNext(baseIntervalSec);
-      } else {
-        failureCountRef.current += 1;
-        const isAuth = result.status === 401 || result.status === 403;
-        setHealthState((prev) => ({
-          ...prev,
-          state: isAuth ? 'auth_error' : 'reconnecting',
-          latencyMs: result.latencyMs,
-          httpStatus: result.status,
-          errorDetail: result.errorDetail || `Status ${result.status}`,
-        }));
-
-        // Exponential backoff with jitter, capped at 60s
-        const backoff = Math.min(
-          60,
-          baseIntervalSec * Math.pow(1.5, Math.min(failureCountRef.current, 4))
-        );
-        const jitter = (Math.random() * 3000) / 1000;
-        scheduleNext(Math.round(backoff + jitter));
-      }
-    } catch (err) {
-      failureCountRef.current += 1;
-      setHealthState((prev) => ({
-        ...prev,
-        state: 'reconnecting',
-        errorDetail: err instanceof Error ? err.message : 'Connection failed',
-      }));
-      const backoff = Math.min(60, baseIntervalSec * 2);
-      scheduleNext(backoff);
-    } finally {
-      isRunningRef.current = false;
-    }
-  };
-
-  const scheduleNext = (seconds: number) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => {
-      performCheck();
-    }, seconds * 1000);
-  };
-
-  useEffect(() => {
-    failureCountRef.current = 0;
-    authCounterRef.current = 0;
-    if (!profile) {
-      setHealthState({
-        state: 'unconfigured',
-        lastChecked: null,
-        latencyMs: null,
-      });
-      return;
-    }
-
-    setHealthState((prev) => ({
-      ...prev,
-      state: 'reconnecting',
-    }));
-
-    // Immediate check on mount or profile change
-    performCheck();
-
-    // Listeners for visibility and online
-    const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        performCheck();
-      } else {
-        if (timerRef.current) clearTimeout(timerRef.current);
-      }
-    };
-
-    const handleOnline = () => {
-      performCheck();
-    };
-
-    const handleOffline = () => {
-      setHealthState((prev) => ({
-        ...prev,
-        state: 'offline',
-        errorDetail: 'Browser went offline',
-      }));
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, [profile?.id, profile?.baseUrl, profile?.apiKey, baseIntervalSec]);
-
+export default defineConfig(() => {
   return {
-    healthState,
-    refreshHealth: performCheck,
+    base,
+    plugins: [
+      react(),
+      tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
+        manifest: {
+          id: base,
+          name: 'Hermes Agent Mobile Client',
+          short_name: 'Hermes',
+          description: 'Mobile-first PWA dashboard and chat client for self-hosted Hermes Agent',
+          theme_color: '#073642',
+          background_color: '#002b36',
+          display: 'standalone',
+          orientation: 'any',
+          start_url: base,
+          scope: base,
+          icons: [
+            {
+              src: 'pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: 'pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: 'pwa-maskable-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable',
+            },
+            {
+              src: 'icon.svg',
+              sizes: '512x512',
+              type: 'image/svg+xml',
+              purpose: 'any',
+            },
+          ],
+        },
+        workbox: {
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          // Never cache API endpoints or external Hermes server calls
+          navigateFallbackDenylist: [/\/v1\//, /\/api\//, /\/health/],
+        },
+        devOptions: {
+          enabled: false,
+          type: 'module',
+        },
+      }),
+    ],
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+      },
+    },
+    server: {
+      hmr: process.env.DISABLE_HMR !== 'true',
+      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
   };
-}
+});
