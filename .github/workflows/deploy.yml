@@ -1,0 +1,66 @@
+name: Build and deploy (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # --legacy-peer-deps: the AI Studio template has a peer-dependency conflict
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # Project pages are served from /<repo-name>/, so the base path must match
+      - name: Build
+        run: npx vite build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/
+
+      # SPA fallback for direct links / reloads on GitHub Pages
+      - name: Add 404 fallback
+        run: cp dist/index.html dist/404.html
+
+      - name: Check PWA files exist
+        run: |
+          test -f dist/manifest.webmanifest
+          test -f dist/sw.js
+          grep -q "/${{ github.event.repository.name }}/" dist/manifest.webmanifest
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    # Deploy only from main, never from pull requests
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
