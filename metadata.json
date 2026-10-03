@@ -1,0 +1,6 @@
+{
+  "name": "Hermes Agent Mobile Client",
+  "description": "Mobile-first Progressive Web App dashboard and chat client for self-hosted Hermes Agent with live telemetry, SSE streaming, runs and scheduled jobs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

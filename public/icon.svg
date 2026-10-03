@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#002b36"/>
+      <stop offset="50%" stop-color="#073642"/>
+      <stop offset="100%" stop-color="#001e26"/>
+    </linearGradient>
+    <linearGradient id="orangeGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff7b25"/>
+      <stop offset="100%" stop-color="#d9531e"/>
+    </linearGradient>
+    <linearGradient id="tealGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2aa198"/>
+      <stop offset="100%" stop-color="#268bd2"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background rounded squircle -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="504" height="504" x="4" y="4" rx="108" fill="none" stroke="#2aa198" stroke-opacity="0.3" stroke-width="4"/>
+
+  <!-- Geometric Wing Left -->
+  <path d="M 120 280 C 120 180, 200 130, 256 160 C 210 180, 180 230, 170 280 Z" fill="url(#tealGlow)" opacity="0.85"/>
+  <path d="M 80 240 C 90 150, 170 100, 230 130 C 180 150, 140 200, 130 250 Z" fill="url(#tealGlow)" opacity="0.6"/>
+
+  <!-- Geometric Wing Right -->
+  <path d="M 392 280 C 392 180, 312 130, 256 160 C 302 180, 332 230, 342 280 Z" fill="url(#tealGlow)" opacity="0.85"/>
+  <path d="M 432 240 C 422 150, 342 100, 282 130 C 332 150, 372 200, 382 250 Z" fill="url(#tealGlow)" opacity="0.6"/>
+
+  <!-- Hermes Helm & Core Node -->
+  <circle cx="256" cy="260" r="76" fill="#073642" stroke="url(#orangeGlow)" stroke-width="6"/>
+  <polygon points="256,195 285,270 227,270" fill="url(#orangeGlow)" filter="url(#glow)"/>
+  <circle cx="256" cy="275" r="22" fill="#ff7b25" filter="url(#glow)"/>
+
+  <!-- Lower Caduceus / Agent Accent -->
+  <path d="M 256 340 L 256 410 M 240 375 L 272 375 M 246 395 L 266 395" stroke="#2aa198" stroke-width="6" stroke-linecap="round"/>
+</svg>
