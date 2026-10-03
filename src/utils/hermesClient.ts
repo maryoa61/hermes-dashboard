@@ -1,33 +1,36 @@
 /**
- * Real Hermes Agent API Client
- * Adheres strictly to the Hermes API Contract:
- * - GET /health & GET /v1/health
- * - GET /v1/models
- * - GET /v1/capabilities
- * - POST /v1/chat/completions (SSE stream, choices[0].delta.content, hermes.tool.progress)
- * - POST /v1/responses, GET/DELETE /v1/responses/{id}
- * - POST /v1/runs, GET /v1/runs/{run_id}, GET /v1/runs/{run_id}/events, POST /v1/runs/{run_id}/stop
- * - GET/POST /api/jobs
+ * Hermes Agent API Client
+ * Strictly follows official Hermes API Server documentation.
  *
- * NO fake data or simulated timeouts.
+ * Requirements:
+ * 1. POST /v1/runs: sends {"input": "<text>"} + optional session_id/instructions. Never "task". Idempotency-Key header.
+ *    Handles HTTP 429 with retry & backoff.
+ * 2. GET /v1/runs removed. Statuses: running, stopping, waiting_for_approval, completed, failed, cancelled, interrupted.
+ * 3. POST /v1/runs/{run_id}/approval for approval decisions.
+ * 4. Unified SSE parser (parseSSEStream).
+ * 5. Runs events stream with 30s inactivity timeout, reconnect, reconciliation via GET /v1/runs/{id}, UI error reporting.
+ * 6. Heartbeat with 8000ms timeout, non-overlapping in-flight guard, fallback on any non-ok, no debug log spam.
+ * 7. Clear distinction between "stopped by user" and "no data for 120 s".
+ * 10. Streaming reasoning_content separated into collapsible thinking block.
  */
 
 import {
   AgentRun,
   CapabilitiesResponse,
-  ChatMessage,
   ConnectionTestResult,
   DebugLogEntry,
   HermesModel,
+  HermesRunStatus,
   HermesServerProfile,
   ModelsResponse,
   ScheduledJob,
   ToolProgressItem,
 } from '../types/hermes';
 import { appendDebugLog, normalizeBaseUrl } from './storage';
+import { parseSSEStream } from './sseParser';
 
 export interface ClassifiedError {
-  type: 'mixed_content' | 'cors_or_unreachable' | 'auth_error' | 'http_error' | 'timeout' | 'aborted' | 'unknown';
+  type: 'mixed_content' | 'cors_or_unreachable' | 'auth_error' | 'http_error' | 'rate_limited' | 'timeout' | 'aborted' | 'unknown';
   message: string;
   statusCode?: number;
   fixSuggestion?: string;
@@ -36,7 +39,6 @@ export interface ClassifiedError {
 export function classifyNetworkError(err: unknown, targetUrl: string, statusCode?: number): ClassifiedError {
   const isHttpsClient = typeof window !== 'undefined' && window.location.protocol === 'https:';
   const isHttpTarget = targetUrl.startsWith('http://');
-  const isLocalHost = targetUrl.includes('localhost') || targetUrl.includes('127.0.0.1');
 
   if (isHttpsClient && isHttpTarget) {
     return {
@@ -44,6 +46,15 @@ export function classifyNetworkError(err: unknown, targetUrl: string, statusCode
       message: 'Blocked by browser security: Mixed Content (HTTPS page cannot make plain HTTP requests).',
       fixSuggestion:
         'Solution: Host Hermes behind an HTTPS reverse proxy (e.g. Caddy, Nginx, Cloudflare Tunnel, or Tailscale Funnel), or access this client from an HTTP environment.',
+    };
+  }
+
+  if (statusCode === 429) {
+    return {
+      type: 'rate_limited',
+      statusCode: 429,
+      message: 'Too many concurrent runs (HTTP 429). The server is busy.',
+      fixSuggestion: 'Wait for current agent runs to complete or retry with backoff.',
     };
   }
 
@@ -99,7 +110,7 @@ export function classifyNetworkError(err: unknown, targetUrl: string, statusCode
 export function buildEndpointUrl(baseUrl: string, endpoint: string): string {
   const normalizedBase = normalizeBaseUrl(baseUrl);
   const baseWithoutV1 = normalizedBase.replace(/\/v1$/, '');
-  
+
   if (endpoint.startsWith('/v1/')) {
     return `${baseWithoutV1}${endpoint}`;
   }
@@ -109,18 +120,45 @@ export function buildEndpointUrl(baseUrl: string, endpoint: string): string {
   if (endpoint.startsWith('/health')) {
     return `${baseWithoutV1}${endpoint}`;
   }
-  // Default fallback
   const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   return `${normalizedBase}${cleanEndpoint}`;
 }
 
 /**
- * Wrapper for fetch that records real latency and sanitizes headers for debug logging
+ * Creates an AbortSignal with a timeout (using AbortSignal.timeout if supported, with fallback)
+ */
+function createTimeoutSignal(timeoutMs: number, parentSignal?: AbortSignal): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Timeout after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  const onParentAbort = () => {
+    controller.abort(parentSignal?.reason);
+  };
+
+  if (parentSignal) {
+    parentSignal.addEventListener('abort', onParentAbort);
+  }
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  };
+
+  return { signal: controller.signal, cleanup };
+}
+
+/**
+ * Wrapper for fetch that records real latency and sanitizes headers for debug logging.
+ * Option skipDebugLog prevents debug log spam (e.g. for periodic heartbeats).
  */
 async function loggedFetch(
   profile: HermesServerProfile,
   endpoint: string,
-  options: RequestInit = {}
+  options: RequestInit & { skipDebugLog?: boolean } = {}
 ): Promise<{ response: Response; durationMs: number; fullUrl: string }> {
   const fullUrl = buildEndpointUrl(profile.baseUrl, endpoint);
   const headers = new Headers(options.headers || {});
@@ -130,6 +168,8 @@ async function loggedFetch(
   }
 
   const startTime = performance.now();
+  const shouldLog = !options.skipDebugLog;
+
   let logEntry: DebugLogEntry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
@@ -146,80 +186,133 @@ async function loggedFetch(
       headers,
     });
     const durationMs = Math.round(performance.now() - startTime);
-    logEntry.durationMs = durationMs;
-    logEntry.status = response.status;
-    
-    // We clone response preview if possible for non-streaming calls
-    if (!options.headers || !(options.headers as Record<string, string>)['Accept']?.includes('text/event-stream')) {
-      response.clone().text().then((txt) => {
-        logEntry.responsePreview = txt.slice(0, 1000);
+
+    if (shouldLog) {
+      logEntry.durationMs = durationMs;
+      logEntry.status = response.status;
+
+      if (!options.headers || !(options.headers as Record<string, string>)['Accept']?.includes('text/event-stream')) {
+        response.clone().text().then((txt) => {
+          logEntry.responsePreview = txt.slice(0, 1000);
+          appendDebugLog(logEntry);
+        }).catch(() => {
+          appendDebugLog(logEntry);
+        });
+      } else {
+        logEntry.responsePreview = '[EventStream]';
         appendDebugLog(logEntry);
-      }).catch(() => {
-        appendDebugLog(logEntry);
-      });
-    } else {
-      logEntry.responsePreview = '[EventStream]';
-      appendDebugLog(logEntry);
+      }
     }
 
     return { response, durationMs, fullUrl };
   } catch (err) {
     const durationMs = Math.round(performance.now() - startTime);
-    logEntry.durationMs = durationMs;
-    logEntry.error = err instanceof Error ? err.message : String(err);
-    appendDebugLog(logEntry);
+    if (shouldLog) {
+      logEntry.durationMs = durationMs;
+      logEntry.error = err instanceof Error ? err.message : String(err);
+      appendDebugLog(logEntry);
+    }
     throw err;
   }
 }
 
+// In-flight guard for health checks so they never overlap
+let isHealthCheckInFlight = false;
+
 /**
- * Health check: GET /health or GET /v1/health
+ * Health check:
+ * - 8000ms AbortSignal.timeout
+ * - in-flight guard so checks never overlap
+ * - fall back to /v1/health on ANY non-ok result (not only network errors)
+ * - Do NOT write heartbeat requests to the debug log
  */
 export async function checkHealth(
   profile: HermesServerProfile,
-  signal?: AbortSignal
+  parentSignal?: AbortSignal
 ): Promise<{ ok: boolean; status: number; latencyMs: number; errorDetail?: string }> {
+  if (isHealthCheckInFlight) {
+    return { ok: false, status: 0, latencyMs: 0, errorDetail: 'Health check already in-flight' };
+  }
+
+  isHealthCheckInFlight = true;
   const startTime = performance.now();
+
   try {
-    const { response, durationMs } = await loggedFetch(profile, '/health', {
-      method: 'GET',
-      signal,
-    });
-    return {
-      ok: response.ok,
-      status: response.status,
-      latencyMs: durationMs,
-      errorDetail: response.ok ? undefined : `HTTP ${response.status}: ${response.statusText}`,
-    };
-  } catch (err) {
-    // If /health failed, fallback to /v1/health per contract
+    // 8000ms timeout per requirement 6
+    const { signal, cleanup } = createTimeoutSignal(8000, parentSignal);
+
     try {
-      const { response, durationMs } = await loggedFetch(profile, '/v1/health', {
+      const res = await loggedFetch(profile, '/health', {
         method: 'GET',
         signal,
+        skipDebugLog: true, // Do not write heartbeat requests to debug log
       });
-      return {
-        ok: response.ok,
-        status: response.status,
-        latencyMs: durationMs,
-        errorDetail: response.ok ? undefined : `HTTP ${response.status}: ${response.statusText}`,
-      };
-    } catch (secondErr) {
-      const durationMs = Math.round(performance.now() - startTime);
-      const classified = classifyNetworkError(secondErr, buildEndpointUrl(profile.baseUrl, '/health'));
-      return {
-        ok: false,
-        status: classified.statusCode || 0,
-        latencyMs: durationMs,
-        errorDetail: classified.message,
-      };
+
+      cleanup();
+
+      if (res.response.ok) {
+        return {
+          ok: true,
+          status: res.response.status,
+          latencyMs: res.durationMs,
+        };
+      }
+
+      // Fall back to /v1/health on ANY non-ok result
+      const fallbackTimeout = createTimeoutSignal(8000, parentSignal);
+      try {
+        const fallbackRes = await loggedFetch(profile, '/v1/health', {
+          method: 'GET',
+          signal: fallbackTimeout.signal,
+          skipDebugLog: true,
+        });
+        fallbackTimeout.cleanup();
+        return {
+          ok: fallbackRes.response.ok,
+          status: fallbackRes.response.status,
+          latencyMs: fallbackRes.durationMs,
+          errorDetail: fallbackRes.response.ok ? undefined : `HTTP ${fallbackRes.response.status}: ${fallbackRes.response.statusText}`,
+        };
+      } catch (fErr) {
+        fallbackTimeout.cleanup();
+        throw fErr;
+      }
+    } catch (primaryErr) {
+      cleanup();
+      // On network error or timeout, attempt fallback /v1/health
+      const fallbackTimeout = createTimeoutSignal(8000, parentSignal);
+      try {
+        const fallbackRes = await loggedFetch(profile, '/v1/health', {
+          method: 'GET',
+          signal: fallbackTimeout.signal,
+          skipDebugLog: true,
+        });
+        fallbackTimeout.cleanup();
+        return {
+          ok: fallbackRes.response.ok,
+          status: fallbackRes.response.status,
+          latencyMs: fallbackRes.durationMs,
+          errorDetail: fallbackRes.response.ok ? undefined : `HTTP ${fallbackRes.response.status}: ${fallbackRes.response.statusText}`,
+        };
+      } catch (fallbackErr) {
+        fallbackTimeout.cleanup();
+        const durationMs = Math.round(performance.now() - startTime);
+        const classified = classifyNetworkError(fallbackErr, buildEndpointUrl(profile.baseUrl, '/v1/health'));
+        return {
+          ok: false,
+          status: classified.statusCode || 0,
+          latencyMs: durationMs,
+          errorDetail: classified.message,
+        };
+      }
     }
+  } finally {
+    isHealthCheckInFlight = false;
   }
 }
 
 /**
  * Step-by-step Connection Validator
- * Runs: 1. GET /health -> 2. GET /v1/models -> 3. GET /v1/capabilities
  */
 export async function testConnectionSteps(
   profile: HermesServerProfile,
@@ -233,7 +326,7 @@ export async function testConnectionSteps(
   ];
   onStepUpdate([...results]);
 
-  // Check 1: Health
+  // Step 1: Health
   try {
     const healthRes = await checkHealth(profile, signal);
     if (healthRes.ok) {
@@ -271,7 +364,7 @@ export async function testConnectionSteps(
   }
   onStepUpdate([...results]);
 
-  // Check 2: Models (verifies API key and model list)
+  // Step 2: Models
   try {
     const { response, durationMs } = await loggedFetch(profile, '/v1/models', {
       method: 'GET',
@@ -315,7 +408,7 @@ export async function testConnectionSteps(
   }
   onStepUpdate([...results]);
 
-  // Check 3: Capabilities Probe
+  // Step 3: Capabilities
   try {
     const { response, durationMs } = await loggedFetch(profile, '/v1/capabilities', {
       method: 'GET',
@@ -337,7 +430,7 @@ export async function testConnectionSteps(
         status: 'failed',
         httpStatus: response.status,
         latencyMs: durationMs,
-        message: `HTTP ${response.status} from /v1/capabilities (Optional endpoint or disabled).`,
+        message: `HTTP ${response.status} from /v1/capabilities.`,
       };
     }
   } catch (err) {
@@ -398,55 +491,89 @@ export async function getCapabilities(
 }
 
 /**
- * GET /v1/runs
+ * POST /v1/runs
+ *
+ * Requirements:
+ * - sends {"input": "<text>"} plus optional session_id / instructions.
+ * - NEVER sends "task".
+ * - Adds an Idempotency-Key header (unique per user action, reused on retry).
+ * - On HTTP 429: show "too many concurrent runs" and retry with backoff.
  */
-export async function getRuns(
-  profile: HermesServerProfile,
-  signal?: AbortSignal
-): Promise<{ ok: boolean; runs: AgentRun[]; status: number; error?: string }> {
-  try {
-    const { response } = await loggedFetch(profile, '/v1/runs', { method: 'GET', signal });
-    if (!response.ok) {
-      return { ok: false, runs: [], status: response.status, error: `HTTP ${response.status}` };
-    }
-    const data = await response.json();
-    const runsList = Array.isArray(data) ? data : Array.isArray(data?.runs) ? data.runs : Array.isArray(data?.data) ? data.data : [];
-    return { ok: true, runs: runsList, status: response.status };
-  } catch (err) {
-    const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/v1/runs'));
-    return { ok: false, runs: [], status: 0, error: classified.message };
-  }
+export interface CreateRunParams {
+  input: string;
+  sessionId?: string;
+  instructions?: string;
+  idempotencyKey?: string;
 }
 
-/**
- * POST /v1/runs
- */
 export async function createRun(
   profile: HermesServerProfile,
-  taskPrompt: string,
-  extraParams: Record<string, unknown> = {},
+  params: CreateRunParams,
+  onRateLimitNotice?: (message: string) => void,
   signal?: AbortSignal
 ): Promise<{ ok: boolean; run: AgentRun | null; status: number; error?: string }> {
-  try {
-    const { response } = await loggedFetch(profile, '/v1/runs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        task: taskPrompt,
-        ...extraParams,
-      }),
-      signal,
-    });
-    if (!response.ok) {
-      const errTxt = await response.text().catch(() => '');
-      return { ok: false, run: null, status: response.status, error: `HTTP ${response.status}: ${errTxt}` };
-    }
-    const data = await response.json();
-    return { ok: true, run: data, status: response.status };
-  } catch (err) {
-    const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/v1/runs'));
-    return { ok: false, run: null, status: 0, error: classified.message };
+  const idempotencyKey = params.idempotencyKey || `run-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+  const bodyPayload: Record<string, unknown> = {
+    input: params.input,
+  };
+  if (params.sessionId) {
+    bodyPayload.session_id = params.sessionId;
   }
+  if (params.instructions) {
+    bodyPayload.instructions = params.instructions;
+  }
+
+  const maxAttempts = 3;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    attempt++;
+    try {
+      const { response } = await loggedFetch(profile, '/v1/runs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: JSON.stringify(bodyPayload),
+        signal,
+      });
+
+      if (response.status === 429) {
+        const backoffMs = attempt * 2500;
+        if (onRateLimitNotice) {
+          onRateLimitNotice(`Too many concurrent runs (HTTP 429). Retrying in ${backoffMs / 1000}s... (attempt ${attempt}/${maxAttempts})`);
+        }
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        return {
+          ok: false,
+          run: null,
+          status: 429,
+          error: 'too many concurrent runs',
+        };
+      }
+
+      if (!response.ok) {
+        const errTxt = await response.text().catch(() => '');
+        return { ok: false, run: null, status: response.status, error: `HTTP ${response.status}: ${errTxt}` };
+      }
+
+      const data = await response.json();
+      return { ok: true, run: data, status: response.status };
+    } catch (err) {
+      if (attempt >= maxAttempts || (err instanceof Error && err.name === 'AbortError')) {
+        const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/v1/runs'));
+        return { ok: false, run: null, status: 0, error: classified.message };
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+
+  return { ok: false, run: null, status: 0, error: 'Failed to create run after retries' };
 }
 
 /**
@@ -492,6 +619,158 @@ export async function stopRun(
 }
 
 /**
+ * POST /v1/runs/{run_id}/approval
+ * Sends the approval decision ("approved" or "declined") to resume or cancel execution.
+ */
+export async function approveRun(
+  profile: HermesServerProfile,
+  runId: string,
+  decision: 'approved' | 'declined',
+  extraPayload: Record<string, unknown> = {}
+): Promise<{ ok: boolean; status: number; error?: string }> {
+  try {
+    const body = {
+      decision,
+      ...extraPayload,
+    };
+    const { response } = await loggedFetch(profile, `/v1/runs/${encodeURIComponent(runId)}/approval`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const errTxt = await response.text().catch(() => '');
+      return { ok: false, status: response.status, error: `HTTP ${response.status}: ${errTxt}` };
+    }
+    return { ok: true, status: response.status };
+  } catch (err) {
+    const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, `/v1/runs/${runId}/approval`));
+    return { ok: false, status: 0, error: classified.message };
+  }
+}
+
+/**
+ * Stream Run Events (/v1/runs/{run_id}/events)
+ *
+ * Requirements:
+ * - 30s inactivity timeout (server sends ": keepalive" every 10s)
+ * - Automatic reconnect with backoff
+ * - Reconcile via GET /v1/runs/{id} after any drop
+ * - Surfaces errors in the UI (via onUIError callback)
+ */
+export interface StreamRunEventsOptions {
+  profile: HermesServerProfile;
+  runId: string;
+  onEvent: (event: { event: string; data: string; parsedData?: unknown }) => void;
+  onStatusReconciled: (run: AgentRun) => void;
+  onUIError: (errorMsg: string) => void;
+  signal?: AbortSignal;
+}
+
+export async function streamRunEvents({
+  profile,
+  runId,
+  onEvent,
+  onStatusReconciled,
+  onUIError,
+  signal,
+}: StreamRunEventsOptions): Promise<void> {
+  const eventsUrl = buildEndpointUrl(profile.baseUrl, `/v1/runs/${encodeURIComponent(runId)}/events`);
+  let reconnectAttempts = 0;
+  const maxReconnectAttempts = 5;
+
+  while (!signal?.aborted) {
+    const headers: Record<string, string> = {
+      Accept: 'text/event-stream',
+    };
+    if (profile.apiKey) {
+      headers['Authorization'] = `Bearer ${profile.apiKey}`;
+    }
+
+    try {
+      const response = await fetch(eventsUrl, {
+        headers,
+        signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${errText || response.statusText}`);
+      }
+
+      reconnectAttempts = 0; // successfully connected
+
+      const parseResult = await parseSSEStream({
+        response,
+        inactivityTimeoutMs: 30_000, // 30s inactivity timeout per requirement 5
+        signal,
+        onEvent: (ev) => {
+          let parsedData: unknown = undefined;
+          try {
+            parsedData = JSON.parse(ev.data);
+          } catch {
+            parsedData = ev.data;
+          }
+          onEvent({ event: ev.event, data: ev.data, parsedData });
+        },
+      });
+
+      // Stream dropped or completed
+      if (parseResult.interrupted) {
+        if (parseResult.abortReason === 'user_abort') {
+          return;
+        }
+        if (parseResult.abortReason === 'inactivity_timeout') {
+          onUIError(`Stream disconnected: ${parseResult.errorMessage || 'no data for 30 s'}. Reconnecting...`);
+        } else if (parseResult.errorMessage) {
+          onUIError(`Stream interrupted: ${parseResult.errorMessage}. Reconnecting...`);
+        }
+      }
+
+      // Reconcile via GET /v1/runs/{id} after any drop per requirement 5
+      const recon = await getRunDetails(profile, runId);
+      if (recon.ok && recon.run) {
+        onStatusReconciled(recon.run);
+        // If run is completed, failed, cancelled, or interrupted, do not reconnect
+        const termStatuses: HermesRunStatus[] = ['completed', 'failed', 'cancelled', 'interrupted'];
+        if (termStatuses.includes(recon.run.status)) {
+          return;
+        }
+      }
+
+      if (parseResult.completedNormally) {
+        return;
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+
+      reconnectAttempts++;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      onUIError(`Connection error: ${errMsg}. Reconciling run status...`);
+
+      // Reconcile via GET /v1/runs/{id}
+      const recon = await getRunDetails(profile, runId);
+      if (recon.ok && recon.run) {
+        onStatusReconciled(recon.run);
+        const termStatuses: HermesRunStatus[] = ['completed', 'failed', 'cancelled', 'interrupted'];
+        if (termStatuses.includes(recon.run.status)) {
+          return;
+        }
+      }
+
+      if (reconnectAttempts > maxReconnectAttempts) {
+        onUIError(`Max reconnect attempts reached (${maxReconnectAttempts}). Stopping stream listener.`);
+        return;
+      }
+
+      const backoffMs = Math.min(30_000, 2000 * Math.pow(1.5, reconnectAttempts));
+      onUIError(`Reconnecting in ${Math.round(backoffMs / 1000)}s... (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+}
+
+/**
  * GET /api/jobs
  */
 export async function getJobs(
@@ -513,47 +792,22 @@ export async function getJobs(
 }
 
 /**
- * POST /api/jobs
- */
-export async function createJob(
-  profile: HermesServerProfile,
-  jobData: Record<string, unknown>
-): Promise<{ ok: boolean; job: ScheduledJob | null; status: number; error?: string }> {
-  try {
-    const { response } = await loggedFetch(profile, '/api/jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(jobData),
-    });
-    if (!response.ok) {
-      const errTxt = await response.text().catch(() => '');
-      return { ok: false, job: null, status: response.status, error: `HTTP ${response.status}: ${errTxt}` };
-    }
-    const data = await response.json();
-    return { ok: true, job: data, status: response.status };
-  } catch (err) {
-    const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/api/jobs'));
-    return { ok: false, job: null, status: 0, error: classified.message };
-  }
-}
-
-/**
- * POST /v1/chat/completions (Reliable SSE Streaming with fetch + ReadableStream)
+ * POST /v1/chat/completions (Reliable SSE Streaming using unified SSE Parser)
  *
  * Handles:
  * - Bearer Auth header
- * - Chunk boundary splitting
- * - Event "hermes.tool.progress": parsed and delegated to onToolProgress (NOT mixed with assistant text)
+ * - Unified SSE parser
  * - choices[0].delta.content: appended to assistant text
- * - [DONE] termination
- * - Inactivity timeout (120s inactivity timer that resets whenever data arrives)
- * - AbortController for instant Stop
+ * - choices[0].delta.reasoning_content: accumulated separately as collapsible thinking
+ * - hermes.tool.progress: captured as subtle tool indicator
+ * - 120s inactivity timeout distinguishing "stopped by user" from "no data for 120 s"
  */
 export interface StreamChatOptions {
   profile: HermesServerProfile;
   messages: Array<{ role: string; content: string }>;
   systemPromptLayer?: string;
   onChunk: (delta: string, fullText: string) => void;
+  onReasoningChunk: (delta: string, fullReasoning: string) => void;
   onToolProgress: (progress: ToolProgressItem) => void;
   onTokenUsage?: (usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }) => void;
   signal?: AbortSignal;
@@ -564,13 +818,19 @@ export async function streamChatCompletions({
   messages,
   systemPromptLayer,
   onChunk,
+  onReasoningChunk,
   onToolProgress,
   onTokenUsage,
   signal,
-}: StreamChatOptions): Promise<{ fullText: string; interrupted: boolean; error?: string }> {
+}: StreamChatOptions): Promise<{
+  fullText: string;
+  fullReasoning: string;
+  interrupted: boolean;
+  abortReason?: 'user_abort' | 'inactivity_timeout' | 'error';
+  errorMessage?: string;
+}> {
   const fullMessages = [...messages];
   if (systemPromptLayer && systemPromptLayer.trim()) {
-    // Client system message layered on top per Hermes contract
     fullMessages.unshift({
       role: 'system',
       content: systemPromptLayer.trim(),
@@ -581,33 +841,11 @@ export async function streamChatCompletions({
   const fullUrl = buildEndpointUrl(profile.baseUrl, '/v1/chat/completions');
 
   let accumulatedText = '';
-  let interrupted = false;
-  let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
-  const INACTIVITY_TIMEOUT_MS = 120_000; // 2 minutes without ANY chunk
-
-  const resetInactivityTimer = (abortFn: () => void) => {
-    if (inactivityTimer) clearTimeout(inactivityTimer);
-    inactivityTimer = setTimeout(() => {
-      console.warn('Hermes streaming inactivity timeout reached');
-      abortFn();
-    }, INACTIVITY_TIMEOUT_MS);
-  };
-
-  const internalAbortController = new AbortController();
-  const combinedSignal = signal;
-
-  const onUserAbort = () => {
-    internalAbortController.abort();
-  };
-  if (combinedSignal) {
-    combinedSignal.addEventListener('abort', onUserAbort);
-  }
-
-  resetInactivityTimer(() => internalAbortController.abort());
+  let accumulatedReasoning = '';
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'Accept': 'text/event-stream',
+    Accept: 'text/event-stream',
   };
   if (profile.apiKey) {
     headers['Authorization'] = `Bearer ${profile.apiKey}`;
@@ -633,7 +871,7 @@ export async function streamChatCompletions({
         messages: fullMessages,
         stream: true,
       }),
-      signal: internalAbortController.signal,
+      signal,
     });
 
     logEntry.status = response.status;
@@ -643,106 +881,82 @@ export async function streamChatCompletions({
       logEntry.durationMs = Math.round(performance.now() - startTime);
       logEntry.responsePreview = errText.slice(0, 1000);
       appendDebugLog(logEntry);
-      
+
       const classified = classifyNetworkError(null, fullUrl, response.status);
       throw new Error(`${classified.message} ${errText ? `(${errText})` : ''}`);
     }
 
-    if (!response.body) {
-      throw new Error('Response body is null, cannot stream SSE');
-    }
+    const parseResult = await parseSSEStream({
+      response,
+      inactivityTimeoutMs: 120_000, // 120s inactivity timeout
+      signal,
+      onEvent: (ev) => {
+        if (ev.data === '[DONE]') return;
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
+        try {
+          const parsed = JSON.parse(ev.data);
 
-    while (true) {
-      const { done, value } = await reader.read();
-      resetInactivityTimer(() => internalAbortController.abort());
-
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // SSE lines split on double newline or newline
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      let currentEvent = 'message';
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith(':')) {
-          continue; // comment or empty heartbeat
-        }
-
-        if (line.startsWith('event:')) {
-          currentEvent = line.slice(6).trim();
-          continue;
-        }
-
-        if (line.startsWith('data:')) {
-          const dataStr = line.slice(5).trim();
-
-          if (dataStr === '[DONE]') {
-            currentEvent = 'message';
-            continue;
+          // 1. Tool progress event
+          if (ev.event === 'hermes.tool.progress' || parsed.event === 'hermes.tool.progress') {
+            const toolInfo: ToolProgressItem = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              timestamp: Date.now(),
+              message: parsed.message || parsed.tool_name || parsed.action || 'Executing tool...',
+              raw: parsed,
+            };
+            onToolProgress(toolInfo);
+            return;
           }
 
-          try {
-            const parsed = JSON.parse(dataStr);
-
-            // 1. Check for custom tool progress event
-            if (currentEvent === 'hermes.tool.progress' || parsed.event === 'hermes.tool.progress') {
-              const toolInfo: ToolProgressItem = {
-                id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                timestamp: Date.now(),
-                message: parsed.message || parsed.tool_name || parsed.action || 'Executing tool...',
-                raw: parsed,
-              };
-              onToolProgress(toolInfo);
-              continue;
-            }
-
-            // 2. Check for token usage if present
-            if (parsed.usage && onTokenUsage) {
-              onTokenUsage(parsed.usage);
-            }
-
-            // 3. Standard OpenAI choices[0].delta.content
-            const deltaContent = parsed.choices?.[0]?.delta?.content;
-            if (typeof deltaContent === 'string' && deltaContent.length > 0) {
-              accumulatedText += deltaContent;
-              onChunk(deltaContent, accumulatedText);
-            }
-          } catch {
-            // Partial JSON or custom text data line
+          // 2. Token usage
+          if (parsed.usage && onTokenUsage) {
+            onTokenUsage(parsed.usage);
           }
-        }
-      }
-    }
 
-    if (inactivityTimer) clearTimeout(inactivityTimer);
+          // 3. Reasoning / thinking content (delta.reasoning_content or delta.thinking)
+          const deltaReasoning =
+            parsed.choices?.[0]?.delta?.reasoning_content ??
+            parsed.choices?.[0]?.delta?.thinking;
+          if (typeof deltaReasoning === 'string' && deltaReasoning.length > 0) {
+            accumulatedReasoning += deltaReasoning;
+            onReasoningChunk(deltaReasoning, accumulatedReasoning);
+          }
+
+          // 4. Standard assistant content delta
+          const deltaContent = parsed.choices?.[0]?.delta?.content;
+          if (typeof deltaContent === 'string' && deltaContent.length > 0) {
+            accumulatedText += deltaContent;
+            onChunk(deltaContent, accumulatedText);
+          }
+        } catch {
+          // Ignore unparseable lines
+        }
+      },
+    });
+
     logEntry.durationMs = Math.round(performance.now() - startTime);
-    logEntry.responsePreview = `[Streaming Complete, ${accumulatedText.length} chars]`;
+    logEntry.responsePreview = `[Streaming Done: ${accumulatedText.length} chars content, ${accumulatedReasoning.length} chars reasoning]`;
     appendDebugLog(logEntry);
 
-    return { fullText: accumulatedText, interrupted: false };
+    return {
+      fullText: accumulatedText,
+      fullReasoning: accumulatedReasoning,
+      interrupted: parseResult.interrupted,
+      abortReason: parseResult.abortReason,
+      errorMessage: parseResult.errorMessage,
+    };
   } catch (err) {
-    if (inactivityTimer) clearTimeout(inactivityTimer);
-    interrupted = true;
     logEntry.durationMs = Math.round(performance.now() - startTime);
     logEntry.error = err instanceof Error ? err.message : String(err);
     appendDebugLog(logEntry);
 
-    const isAbort = err instanceof Error && err.name === 'AbortError';
+    const isUserAbort = err instanceof Error && err.name === 'AbortError' && signal?.aborted;
     return {
       fullText: accumulatedText,
+      fullReasoning: accumulatedReasoning,
       interrupted: true,
-      error: isAbort ? 'Stream stopped by user' : err instanceof Error ? err.message : 'Streaming interrupted',
+      abortReason: isUserAbort ? 'user_abort' : 'error',
+      errorMessage: isUserAbort ? 'stopped by user' : err instanceof Error ? err.message : 'Streaming interrupted',
     };
-  } finally {
-    if (combinedSignal) {
-      combinedSignal.removeEventListener('abort', onUserAbort);
-    }
   }
 }

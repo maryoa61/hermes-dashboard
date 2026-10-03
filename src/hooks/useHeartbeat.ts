@@ -17,6 +17,7 @@ export function useHeartbeat(
   const isRunningRef = useRef(false);
 
   const performCheck = async () => {
+    if (isRunningRef.current) return;
     if (!profile) {
       setHealthState({
         state: 'unconfigured',
@@ -41,6 +42,7 @@ export function useHeartbeat(
       return;
     }
 
+    isRunningRef.current = true;
     try {
       const result = await checkHealth(profile);
 
@@ -82,6 +84,8 @@ export function useHeartbeat(
       }));
       const backoff = Math.min(60, baseIntervalSec * 2);
       scheduleNext(backoff);
+    } finally {
+      isRunningRef.current = false;
     }
   };
 

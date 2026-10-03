@@ -15,6 +15,7 @@ import {
   saveActiveProfileId,
   saveProfiles,
   saveSettings,
+  subscribeToStorageErrors,
 } from './utils/storage';
 import { useHeartbeat } from './hooks/useHeartbeat';
 import { Header } from './components/Header';
@@ -24,7 +25,7 @@ import { ChatView } from './views/ChatView';
 import { RunsView } from './views/RunsView';
 import { SettingsView } from './views/SettingsView';
 import { DebugView } from './views/DebugView';
-import { WifiOff } from 'lucide-react';
+import { WifiOff, AlertOctagon, X } from 'lucide-react';
 
 export default function App() {
   const [profiles, setProfiles] = useState<HermesServerProfile[]>(() => loadProfiles());
@@ -32,6 +33,14 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [storageError, setStorageError] = useState<string | null>(null);
+
+  // Subscribe to IndexedDB storage errors
+  useEffect(() => {
+    subscribeToStorageErrors((err) => {
+      setStorageError(err);
+    });
+  }, []);
 
   // Active profile object
   const activeProfile = profiles.find((p) => p.id === activeProfileId) || (profiles.length > 0 ? profiles[0] : null);
@@ -103,6 +112,23 @@ export default function App() {
         <div className="bg-amber-600 text-white px-3 py-1 text-center text-xs font-medium flex items-center justify-center gap-1.5 z-50 shrink-0">
           <WifiOff className="w-3.5 h-3.5" />
           <span>Browser is offline. Showing cached interface shell.</span>
+        </div>
+      )}
+
+      {/* Storage Error Banner per Requirement 8 */}
+      {storageError && (
+        <div className="bg-rose-700 text-white px-3 py-1.5 text-xs font-medium flex items-center justify-between z-50 shrink-0 shadow-md">
+          <div className="flex items-center gap-2">
+            <AlertOctagon className="w-4 h-4 shrink-0" />
+            <span>{storageError}</span>
+          </div>
+          <button
+            onClick={() => setStorageError(null)}
+            className="p-1 hover:bg-rose-800 rounded"
+            title="Dismiss"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 

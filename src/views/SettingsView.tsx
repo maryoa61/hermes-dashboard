@@ -172,25 +172,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleExport = () => {
+  const handleExport = async () => {
     if (!window.confirm(t.exportWarning)) return;
-    const dataStr = exportAppData();
-    const blob = new Blob([dataStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `hermes-client-settings-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const dataStr = await exportAppData();
+      const blob = new Blob([dataStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `hermes-client-settings-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       const content = event.target?.result as string;
-      const res = importAppData(content);
+      const res = await importAppData(content);
       if (res.success) {
         window.location.reload();
       } else {
@@ -200,9 +204,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     reader.readAsText(file);
   };
 
-  const handleForgetAll = () => {
+  const handleForgetAll = async () => {
     if (window.confirm(t.forgetAllConfirm)) {
-      forgetEverything();
+      await forgetEverything();
       window.location.reload();
     }
   };

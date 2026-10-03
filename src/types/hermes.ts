@@ -1,5 +1,6 @@
 /**
  * Hermes Agent Data & Protocol Types
+ * Strictly aligned with official Hermes API Server documentation.
  */
 
 export interface HermesServerProfile {
@@ -37,6 +38,8 @@ export interface ModelsResponse {
 }
 
 export interface CapabilitiesResponse {
+  features?: string[];
+  capabilities?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -51,6 +54,7 @@ export interface ChatMessage {
   id: string;
   role: 'system' | 'user' | 'assistant';
   content: string;
+  reasoning?: string; // Collapsible reasoning_content separate from answer
   timestamp: number;
   interrupted?: boolean;
   toolProgress?: ToolProgressItem[];
@@ -70,17 +74,58 @@ export interface Conversation {
   updatedAt: number;
 }
 
+/**
+ * Valid Hermes Agent Run Statuses per official docs:
+ * running, stopping, waiting_for_approval, completed, failed, cancelled, interrupted
+ * (in_progress and success removed)
+ */
+export type HermesRunStatus =
+  | 'running'
+  | 'stopping'
+  | 'waiting_for_approval'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'unknown';
+
+export interface ApprovalRequestData {
+  tool_name?: string;
+  action?: string;
+  command?: string;
+  arguments?: Record<string, unknown> | string;
+  reason?: string;
+  rawEvent?: unknown;
+}
+
 export interface AgentRun {
   id: string;
   run_id?: string;
-  status?: string;
-  task?: string;
+  status: HermesRunStatus;
+  input?: string;
+  session_id?: string;
+  instructions?: string;
   created_at?: string | number;
   started_at?: string | number;
   completed_at?: string | number;
   error?: string;
   result?: unknown;
+  approval_request?: ApprovalRequestData;
   [key: string]: unknown;
+}
+
+export interface LocalAgentRunRecord {
+  runId: string;
+  profileId: string;
+  input: string;
+  sessionId?: string;
+  instructions?: string;
+  idempotencyKey: string;
+  status: HermesRunStatus;
+  createdAt: number;
+  updatedAt: number;
+  lastError?: string;
+  details?: AgentRun;
 }
 
 export interface AgentRunEvent {

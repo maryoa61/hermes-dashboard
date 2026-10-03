@@ -15,17 +15,19 @@ import {
 } from 'lucide-react';
 import { ChatMessage, Conversation, HermesServerProfile, ToolProgressItem } from '../types/hermes';
 import {
+  idbDeleteConversation,
+  idbGetConversations,
+  idbSaveConversation,
   loadActiveConversationId,
-  loadConversations,
   loadDraft,
   saveActiveConversationId,
-  saveConversations,
   saveDraft,
 } from '../utils/storage';
 import { streamChatCompletions } from '../utils/hermesClient';
 import { releaseScreenWakeLock, requestScreenWakeLock } from '../utils/wakeLock';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import { ToolProgressBadge } from '../components/ToolProgressBadge';
+import { ThinkingBlock } from '../components/ThinkingBlock';
 import { translations } from '../i18n/translations';
 
 interface ChatViewProps {
@@ -43,7 +45,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
 }) => {
   const t = translations[language];
 
-  const [conversations, setConversations] = useState<Conversation[]>(() => loadConversations());
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string | null>(() => loadActiveConversationId());
   const [inputText, setInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -54,19 +56,24 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Active conversation object
-  const currentConversation = conversations.find((c) => c.id === activeConvId);
-
-  // Ensure an active conversation exists
-  useEffect(() => {
-    if (conversations.length === 0) {
+  // Load conversations from IndexedDB
+  const refreshConversations = async () => {
+    const list = await idbGetConversations();
+    setConversations(list);
+    if (list.length === 0) {
       createNewConversation();
-    } else if (!activeConvId || !conversations.some((c) => c.id === activeConvId)) {
-      const firstId = conversations[0].id;
+    } else if (!activeConvId || !list.some((c) => c.id === activeConvId)) {
+      const firstId = list[0].id;
       setActiveConvId(firstId);
       saveActiveConversationId(firstId);
     }
-  }, [conversations.length, activeConvId]);
+  };
+
+  useEffect(() => {
+    refreshConversations();
+  }, []);
+
+  const currentConversation = conversations.find((c) => c.id === activeConvId);
 
   // Load draft when conversation changes
   useEffect(() => {
@@ -81,7 +88,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [currentConversation?.messages.length, isStreaming, activeToolProgress.length]);
 
-  // Auto-resize textarea
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setInputText(val);
@@ -95,7 +101,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     }
   };
 
-  const createNewConversation = () => {
+  const createNewConversation = async () => {
     const newConv: Conversation = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       title: `${t.newChat} ${conversations.length + 1}`,
@@ -104,21 +110,21 @@ export const ChatView: React.FC<ChatViewProps> = ({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    await idbSaveConversation(newConv);
     const updated = [newConv, ...conversations];
     setConversations(updated);
-    saveConversations(updated);
     setActiveConvId(newConv.id);
     saveActiveConversationId(newConv.id);
     setInputText('');
     setSidebarOpen(false);
   };
 
-  const deleteConversation = (convId: string, e: React.MouseEvent) => {
+  const deleteConversation = async (convId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!window.confirm(t.deleteChatConfirm)) return;
+    await idbDeleteConversation(convId);
     const remaining = conversations.filter((c) => c.id !== convId);
     setConversations(remaining);
-    saveConversations(remaining);
     if (activeConvId === convId) {
       const nextId = remaining.length > 0 ? remaining[0].id : null;
       setActiveConvId(nextId);
@@ -175,11 +181,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
       id: assistantMessageId,
       role: 'assistant',
       content: '',
+      reasoning: '',
       timestamp: Date.now(),
       toolProgress: [],
     };
 
-    // Update conversation title if first message
     let newTitle = currentConversation.title;
     if (currentConversation.messages.length === 0) {
       newTitle = messageText.slice(0, 30);
@@ -195,9 +201,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
     const nextConversations = conversations.map((c) => (c.id === currentConversation.id ? updatedConv : c));
     setConversations(nextConversations);
-    saveConversations(nextConversations);
+    await idbSaveConversation(updatedConv);
 
-    // Prepare streaming
     setIsStreaming(true);
     setActiveToolProgress([]);
     await requestScreenWakeLock();
@@ -206,7 +211,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     abortControllerRef.current = abortController;
 
     const messagePayload = updatedMessages
-      .slice(0, -1) // omit the empty assistant placeholder
+      .slice(0, -1)
       .map((m) => ({ role: m.role, content: m.content }));
 
     const collectedTools: ToolProgressItem[] = [];
@@ -224,6 +229,20 @@ export const ChatView: React.FC<ChatViewProps> = ({
               const msgs = c.messages.map((m) => {
                 if (m.id === assistantMessageId) {
                   return { ...m, content: fullText };
+                }
+                return m;
+              });
+              return { ...c, messages: msgs, updatedAt: Date.now() };
+            })
+          );
+        },
+        onReasoningChunk: (_delta, fullReasoning) => {
+          setConversations((prevConvs) =>
+            prevConvs.map((c) => {
+              if (c.id !== currentConversation.id) return c;
+              const msgs = c.messages.map((m) => {
+                if (m.id === assistantMessageId) {
+                  return { ...m, reasoning: fullReasoning };
                 }
                 return m;
               });
@@ -263,7 +282,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         },
       });
 
-      // Finalize message state
+      // Finalize and save to IndexedDB
       setConversations((prevConvs) => {
         const finalized = prevConvs.map((c) => {
           if (c.id !== currentConversation.id) return c;
@@ -271,16 +290,18 @@ export const ChatView: React.FC<ChatViewProps> = ({
             if (m.id === assistantMessageId) {
               return {
                 ...m,
-                content: result.fullText || (result.interrupted ? '(Interrupted)' : m.content),
+                content: result.fullText || (result.interrupted ? `(${result.errorMessage || 'Interrupted'})` : m.content),
+                reasoning: result.fullReasoning,
                 interrupted: result.interrupted,
                 toolProgress: collectedTools,
               };
             }
             return m;
           });
-          return { ...c, messages: msgs, updatedAt: Date.now() };
+          const updated = { ...c, messages: msgs, updatedAt: Date.now() };
+          idbSaveConversation(updated);
+          return updated;
         });
-        saveConversations(finalized);
         return finalized;
       });
     } catch (err) {
@@ -301,12 +322,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
       .find((m) => m.role === 'user');
 
     if (priorUserMsg) {
-      // Remove all messages from msgIndex onwards
       const pruned = currentConversation.messages.slice(0, msgIndex);
       const updatedConv = { ...currentConversation, messages: pruned };
       const nextConversations = conversations.map((c) => (c.id === currentConversation.id ? updatedConv : c));
       setConversations(nextConversations);
-      saveConversations(nextConversations);
+      idbSaveConversation(updatedConv);
 
       handleSendMessage(priorUserMsg.content);
     }
@@ -426,6 +446,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         ) : (
           currentConversation.messages.map((msg, idx) => {
             const isUser = msg.role === 'user';
+            const isLastMessage = idx === currentConversation.messages.length - 1;
             return (
               <div
                 key={msg.id || idx}
@@ -448,26 +469,34 @@ export const ChatView: React.FC<ChatViewProps> = ({
                   {msg.toolProgress && msg.toolProgress.length > 0 && (
                     <ToolProgressBadge
                       progressList={msg.toolProgress}
-                      isActive={isStreaming && idx === currentConversation.messages.length - 1}
+                      isActive={isStreaming && isLastMessage}
+                    />
+                  )}
+
+                  {/* Thinking Block for reasoning_content per Requirement 10 */}
+                  {msg.reasoning && (
+                    <ThinkingBlock
+                      reasoning={msg.reasoning}
+                      isStreaming={isStreaming && isLastMessage && !msg.content}
                     />
                   )}
 
                   {/* Message content */}
                   {msg.content ? (
                     <MarkdownRenderer content={msg.content} />
-                  ) : isStreaming && idx === currentConversation.messages.length - 1 ? (
+                  ) : isStreaming && isLastMessage ? (
                     <div className="flex items-center gap-1.5 text-xs text-[#ff7b25] py-1 animate-pulse">
                       <span className="w-2 h-2 rounded-full bg-[#ff7b25]" />
-                      <span>Hermes is thinking...</span>
+                      <span>Hermes is generating...</span>
                     </div>
                   ) : null}
 
-                  {/* Interrupted notice and Retry button */}
+                  {/* Interrupted notice and Retry button per Requirement 7 */}
                   {msg.interrupted && (
                     <div className="mt-2 pt-2 border-t border-rose-900/40 flex items-center justify-between text-xs text-rose-400">
                       <div className="flex items-center gap-1">
                         <AlertCircle className="w-3.5 h-3.5" />
-                        <span>{t.interrupted}</span>
+                        <span>{msg.content?.includes('no data for') ? msg.content.replace(/[()]/g, '') : t.interrupted}</span>
                       </div>
                       <button
                         onClick={() => handleRetry(idx)}

@@ -1,10 +1,19 @@
-import { AppSettings, Conversation, DebugLogEntry, HermesServerProfile } from '../types/hermes';
+import { AppSettings, Conversation, DebugLogEntry, HermesServerProfile, LocalAgentRunRecord } from '../types/hermes';
+import {
+  idbClearAll,
+  idbDeleteConversation,
+  idbDeleteLocalRun,
+  idbGetConversations,
+  idbGetLocalRuns,
+  idbSaveConversation,
+  idbSaveLocalRun,
+  setStorageErrorListener,
+} from './idb';
 
 const STORAGE_KEYS = {
   PROFILES: 'hermes_profiles',
   ACTIVE_PROFILE_ID: 'hermes_active_profile_id',
   SETTINGS: 'hermes_app_settings',
-  CONVERSATIONS: 'hermes_conversations',
   ACTIVE_CONVERSATION_ID: 'hermes_active_conv_id',
   DRAFTS: 'hermes_chat_drafts',
   DEBUG_LOGS: 'hermes_debug_logs',
@@ -12,14 +21,14 @@ const STORAGE_KEYS = {
 
 const DEFAULT_SETTINGS: AppSettings = {
   activeProfileId: null,
-  language: 'fa', // Primary requested language with RTL support
+  language: 'fa',
   fontSize: 'md',
   useResponsesApi: false,
   heartbeatIntervalSec: 20,
   systemPromptAddition: '',
 };
 
-// URL Normalizer: removes trailing slash, cleans whitespace
+// URL Normalizer
 export function normalizeBaseUrl(rawUrl: string): string {
   if (!rawUrl) return '';
   let url = rawUrl.trim();
@@ -29,7 +38,12 @@ export function normalizeBaseUrl(rawUrl: string): string {
   return url;
 }
 
-// Storage helpers
+// Storage listeners
+export function subscribeToStorageErrors(callback: (err: string) => void) {
+  setStorageErrorListener(callback);
+}
+
+// Profiles
 export function loadProfiles(): HermesServerProfile[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEYS.PROFILES);
@@ -86,22 +100,16 @@ export function saveSettings(settings: AppSettings): void {
   }
 }
 
-export function loadConversations(): Conversation[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.CONVERSATIONS);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
+// ----------------- IndexedDB Conversations & Runs -----------------
 
-export function saveConversations(convs: Conversation[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEYS.CONVERSATIONS, JSON.stringify(convs));
-  } catch (err) {
-    console.error('Failed to save conversations', err);
-  }
-}
+export {
+  idbGetConversations,
+  idbSaveConversation,
+  idbDeleteConversation,
+  idbGetLocalRuns,
+  idbSaveLocalRun,
+  idbDeleteLocalRun,
+};
 
 export function loadActiveConversationId(): string | null {
   try {
@@ -179,19 +187,22 @@ export function clearDebugLogs(): void {
 }
 
 // Export / Import
-export function exportAppData(): string {
+export async function exportAppData(): Promise<string> {
+  const convs = await idbGetConversations();
+  const runs = await idbGetLocalRuns();
   const data = {
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     profiles: loadProfiles(),
     activeProfileId: loadActiveProfileId(),
     settings: loadSettings(),
-    conversations: loadConversations(),
+    conversations: convs,
+    runs,
   };
   return JSON.stringify(data, null, 2);
 }
 
-export function importAppData(jsonString: string): { success: boolean; error?: string } {
+export async function importAppData(jsonString: string): Promise<{ success: boolean; error?: string }> {
   try {
     const parsed = JSON.parse(jsonString);
     if (!parsed || typeof parsed !== 'object') {
@@ -207,7 +218,14 @@ export function importAppData(jsonString: string): { success: boolean; error?: s
       saveSettings({ ...DEFAULT_SETTINGS, ...parsed.settings });
     }
     if (Array.isArray(parsed.conversations)) {
-      saveConversations(parsed.conversations);
+      for (const c of parsed.conversations) {
+        await idbSaveConversation(c);
+      }
+    }
+    if (Array.isArray(parsed.runs)) {
+      for (const r of parsed.runs) {
+        await idbSaveLocalRun(r);
+      }
     }
     return { success: true };
   } catch (err) {
@@ -216,9 +234,10 @@ export function importAppData(jsonString: string): { success: boolean; error?: s
 }
 
 // "Forget everything"
-export function forgetEverything(): void {
+export async function forgetEverything(): Promise<void> {
   try {
     localStorage.clear();
+    await idbClearAll();
   } catch (err) {
     console.error('Failed to clear storage', err);
   }

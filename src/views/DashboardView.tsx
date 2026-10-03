@@ -10,16 +10,18 @@ import {
   Server,
   ArrowRight,
   ExternalLink,
+  ShieldCheck,
 } from 'lucide-react';
 import {
-  AgentRun,
   CapabilitiesResponse,
   HealthState,
   HermesModel,
   HermesServerProfile,
+  LocalAgentRunRecord,
   ScheduledJob,
 } from '../types/hermes';
-import { getCapabilities, getJobs, getModels, getRuns } from '../utils/hermesClient';
+import { getCapabilities, getJobs, getModels, getRunDetails } from '../utils/hermesClient';
+import { idbGetLocalRuns } from '../utils/storage';
 import { translations } from '../i18n/translations';
 import { PWAInstallBanner } from '../components/PWAInstallBanner';
 
@@ -48,9 +50,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [capsLoading, setCapsLoading] = useState(false);
   const [capsError, setCapsError] = useState<string | null>(null);
 
-  const [runs, setRuns] = useState<AgentRun[]>([]);
+  // Local runs from IndexedDB (polled individually via GET /v1/runs/{id}, since GET /v1/runs is undocumented)
+  const [localRuns, setLocalRuns] = useState<LocalAgentRunRecord[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
-  const [runsError, setRunsError] = useState<string | null>(null);
 
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(false);
@@ -61,6 +63,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   // Mixed content warning check
   const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
   const isMixedContent = isHttps && profile?.baseUrl.startsWith('http://');
+
+  // Capability inspection helpers per Requirement 9
+  const supportedFeatures = Array.isArray(capabilities?.features)
+    ? capabilities.features
+    : typeof capabilities?.capabilities === 'object' && capabilities.capabilities
+    ? Object.keys(capabilities.capabilities)
+    : capabilities
+    ? Object.keys(capabilities)
+    : [];
+
+  const supportsFeature = (featureName: string): boolean => {
+    if (!capabilities) return true; // until capabilities load, do not prematurely hide everything
+    return supportedFeatures.some(
+      (f) => f.toLowerCase().includes(featureName.toLowerCase()) || f.toLowerCase() === featureName.toLowerCase()
+    );
+  };
 
   const fetchAllData = async () => {
     if (!profile) return;
@@ -81,7 +99,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       }
     });
 
-    // 2. Capabilities
+    // 2. Capabilities (/v1/capabilities)
     setCapsLoading(true);
     setCapsError(null);
     getCapabilities(profile).then((res) => {
@@ -94,20 +112,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       }
     });
 
-    // 3. Runs
+    // 3. Local Runs (polled via GET /v1/runs/{id} for active items)
     setRunsLoading(true);
-    setRunsError(null);
-    getRuns(profile).then((res) => {
+    idbGetLocalRuns(profile.id).then(async (runs) => {
+      setLocalRuns(runs);
       setRunsLoading(false);
-      if (res.ok) {
-        setRuns(res.runs);
-      } else {
-        setRunsError(res.error || 'Endpoint unavailable');
-        setRuns([]);
+      // Refresh status for top 3 runs
+      for (const r of runs.slice(0, 3)) {
+        getRunDetails(profile, r.runId).then((res) => {
+          if (res.ok && res.run) {
+            setLocalRuns((prev) =>
+              prev.map((item) => (item.runId === r.runId ? { ...item, status: res.run?.status || item.status } : item))
+            );
+          }
+        });
       }
     });
 
-    // 4. Jobs
+    // 4. Jobs (/api/jobs) - if server capabilities don't explicitly disable it
     setJobsLoading(true);
     setJobsError(null);
     getJobs(profile).then((res) => {
@@ -129,7 +151,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     } else {
       setModels([]);
       setCapabilities(null);
-      setRuns([]);
+      setLocalRuns([]);
       setJobs([]);
     }
   }, [profile?.id, profile?.baseUrl, profile?.apiKey]);
@@ -300,16 +322,31 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           ) : !capabilities || Object.keys(capabilities).length === 0 ? (
             <div className="text-xs text-[#586e75] py-4 text-center">{t.noCapabilities}</div>
           ) : (
-            <div
-              className="p-2.5 rounded-lg bg-[#001e26] border border-[#073642] max-h-36 overflow-y-auto font-mono text-[11px] text-[#2aa198]"
-              dir="ltr"
-            >
-              <pre className="whitespace-pre-wrap">{JSON.stringify(capabilities, null, 2)}</pre>
+            <div className="space-y-2">
+              {supportedFeatures.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pb-1">
+                  {supportedFeatures.map((f, i) => (
+                    <span
+                      key={i}
+                      className="px-2 py-0.5 rounded-md bg-[#001e26] border border-[#2aa198]/40 text-[#2aa198] text-[10px] font-mono flex items-center gap-1"
+                    >
+                      <ShieldCheck className="w-3 h-3 text-[#ff7b25]" />
+                      <span>{f}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div
+                className="p-2.5 rounded-lg bg-[#001e26] border border-[#073642] max-h-32 overflow-y-auto font-mono text-[11px] text-[#93a1a1]"
+                dir="ltr"
+              >
+                <pre className="whitespace-pre-wrap">{JSON.stringify(capabilities, null, 2)}</pre>
+              </div>
             </div>
           )}
         </div>
 
-        {/* Card 4: Active / Recent Runs (/v1/runs) */}
+        {/* Card 4: Local Runs Registry (polled via GET /v1/runs/{id}, list endpoint removed) */}
         <div className="p-4 rounded-xl bg-[#073642]/40 border border-[#073642] hover:border-[#2aa198]/30 transition shadow-sm space-y-3">
           <div className="flex items-center justify-between text-[#2aa198]">
             <div className="flex items-center gap-2">
@@ -328,33 +365,33 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {runsLoading ? (
             <div className="flex items-center justify-center py-6 text-xs text-[#586e75]">
               <RefreshCw className="w-4 h-4 animate-spin text-[#ff7b25] mr-2" />
-              <span>Fetching /v1/runs...</span>
+              <span>Checking active runs...</span>
             </div>
-          ) : runsError ? (
-            <div className="text-xs text-[#586e75] p-2.5 rounded-lg bg-[#002b36]/60 border border-[#073642]">
-              {t.cardUnavailable}
-            </div>
-          ) : runs.length === 0 ? (
+          ) : localRuns.length === 0 ? (
             <div className="text-xs text-[#586e75] py-4 text-center">{t.noRunsFound}</div>
           ) : (
             <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1" dir="ltr">
-              {runs.slice(0, 3).map((r) => (
+              {localRuns.slice(0, 3).map((r) => (
                 <div
-                  key={r.id || r.run_id || Math.random().toString()}
+                  key={r.runId}
                   className="p-2 rounded-lg bg-[#002b36]/80 border border-[#073642] flex items-center justify-between text-xs font-mono"
                 >
                   <div className="truncate max-w-[180px]">
-                    <span className="font-semibold text-[#eee8d5]">{r.id || r.run_id}</span>
-                    <div className="text-[10px] text-[#586e75] truncate">{r.task || 'Run task'}</div>
+                    <span className="font-semibold text-[#eee8d5]">{r.runId}</span>
+                    <div className="text-[10px] text-[#586e75] truncate">{r.input || 'Agent run'}</div>
                   </div>
                   <span
                     className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${
                       r.status === 'running'
                         ? 'bg-amber-950/80 text-amber-300 border border-amber-600/40'
+                        : r.status === 'waiting_for_approval'
+                        ? 'bg-[#ff7b25]/20 text-[#ff7b25] border border-[#ff7b25]/50'
+                        : r.status === 'completed'
+                        ? 'bg-emerald-950/80 text-emerald-400'
                         : 'bg-[#073642] text-[#93a1a1]'
                     }`}
                   >
-                    {r.status || 'active'}
+                    {r.status}
                   </span>
                 </div>
               ))}
@@ -362,38 +399,40 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           )}
         </div>
 
-        {/* Card 5: Scheduled Jobs (/api/jobs) */}
-        <div className="p-4 rounded-xl bg-[#073642]/40 border border-[#073642] hover:border-[#2aa198]/30 transition shadow-sm space-y-3 md:col-span-2">
-          <div className="flex items-center justify-between text-[#2aa198]">
-            <div className="flex items-center gap-2">
-              <Clock className="w-4 h-4 text-[#ff7b25]" />
-              <span className="text-xs font-bold uppercase tracking-wider text-[#eee8d5]">{t.scheduledJobsCard}</span>
+        {/* Card 5: Scheduled Jobs (/api/jobs) - only shown if server doesn't prohibit */}
+        {supportsFeature('jobs') && (
+          <div className="p-4 rounded-xl bg-[#073642]/40 border border-[#073642] hover:border-[#2aa198]/30 transition shadow-sm space-y-3 md:col-span-2">
+            <div className="flex items-center justify-between text-[#2aa198]">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-[#ff7b25]" />
+                <span className="text-xs font-bold uppercase tracking-wider text-[#eee8d5]">{t.scheduledJobsCard}</span>
+              </div>
+              <span className="text-xs font-mono text-[#586e75]">/api/jobs ({jobs.length})</span>
             </div>
-            <span className="text-xs font-mono text-[#586e75]">/api/jobs ({jobs.length})</span>
-          </div>
 
-          {jobsLoading ? (
-            <div className="flex items-center justify-center py-4 text-xs text-[#586e75]">
-              <RefreshCw className="w-4 h-4 animate-spin text-[#ff7b25] mr-2" />
-              <span>Checking /api/jobs...</span>
-            </div>
-          ) : jobsError ? (
-            <div className="text-xs text-[#586e75] p-2.5 rounded-lg bg-[#002b36]/60 border border-[#073642]">
-              {t.cardUnavailable}
-            </div>
-          ) : jobs.length === 0 ? (
-            <div className="text-xs text-[#586e75] py-2 text-center">{t.noJobsFound}</div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto" dir="ltr">
-              {jobs.map((j, idx) => (
-                <div key={j.id || idx} className="p-2 rounded bg-[#002b36]/70 border border-[#073642] text-xs font-mono">
-                  <div className="font-semibold text-[#2aa198] truncate">{j.name || j.id || `Job #${idx + 1}`}</div>
-                  <div className="text-[10px] text-[#839496] truncate">{j.cron || j.schedule || 'Scheduled interval'}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+            {jobsLoading ? (
+              <div className="flex items-center justify-center py-4 text-xs text-[#586e75]">
+                <RefreshCw className="w-4 h-4 animate-spin text-[#ff7b25] mr-2" />
+                <span>Checking /api/jobs...</span>
+              </div>
+            ) : jobsError ? (
+              <div className="text-xs text-[#586e75] p-2.5 rounded-lg bg-[#002b36]/60 border border-[#073642]">
+                {t.cardUnavailable}
+              </div>
+            ) : jobs.length === 0 ? (
+              <div className="text-xs text-[#586e75] py-2 text-center">{t.noJobsFound}</div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto" dir="ltr">
+                {jobs.map((j, idx) => (
+                  <div key={j.id || idx} className="p-2 rounded bg-[#002b36]/70 border border-[#073642] text-xs font-mono">
+                    <div className="font-semibold text-[#2aa198] truncate">{j.name || j.id || `Job #${idx + 1}`}</div>
+                    <div className="text-[10px] text-[#839496] truncate">{j.cron || j.schedule || 'Scheduled interval'}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
