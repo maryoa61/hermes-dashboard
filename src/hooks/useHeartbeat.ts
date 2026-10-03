@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { HealthState, HermesServerProfile } from '../types/hermes';
-import { checkHealth } from '../utils/hermesClient';
+import { checkAuth, checkHealth } from '../utils/hermesClient';
 
 export function useHeartbeat(
   profile: HermesServerProfile | null,
@@ -13,6 +13,7 @@ export function useHeartbeat(
   });
 
   const failureCountRef = useRef(0);
+  const authCounterRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isRunningRef = useRef(false);
 
@@ -48,12 +49,26 @@ export function useHeartbeat(
 
       if (result.ok) {
         failureCountRef.current = 0;
+
+        // /health is public: verify the API key on the first success and then
+        // every 6th check (~2 min at the default 20 s interval)
+        let nextState: 'connected' | 'auth_error' = 'connected';
+        let authDetail: string | undefined;
+        if (authCounterRef.current % 6 === 0) {
+          const auth = await checkAuth(profile);
+          if (!auth.authOk && (auth.status === 401 || auth.status === 403)) {
+            nextState = 'auth_error';
+            authDetail = auth.errorDetail;
+          }
+        }
+        authCounterRef.current += 1;
+
         setHealthState({
-          state: 'connected',
+          state: nextState,
           lastChecked: Date.now(),
           latencyMs: result.latencyMs,
           httpStatus: result.status,
-          errorDetail: undefined,
+          errorDetail: authDetail,
         });
         scheduleNext(baseIntervalSec);
       } else {
@@ -98,6 +113,7 @@ export function useHeartbeat(
 
   useEffect(() => {
     failureCountRef.current = 0;
+    authCounterRef.current = 0;
     if (!profile) {
       setHealthState({
         state: 'unconfigured',
