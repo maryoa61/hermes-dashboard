@@ -216,98 +216,107 @@ async function loggedFetch(
   }
 }
 
-// In-flight guard for health checks so they never overlap
-let isHealthCheckInFlight = false;
+type HealthResult = { ok: boolean; status: number; latencyMs: number; errorDetail?: string };
+
+// One shared in-flight request per server, so concurrent callers (heartbeat,
+// "Test connection", Refresh) never get a fake failure.
+const healthInFlight = new Map<string, Promise<HealthResult>>();
+
+async function probeHealthPath(
+  profile: HermesServerProfile,
+  path: '/health' | '/v1/health',
+  parentSignal?: AbortSignal
+): Promise<HealthResult> {
+  const { signal, cleanup } = createTimeoutSignal(8000, parentSignal);
+  try {
+    const res = await loggedFetch(profile, path, { method: 'GET', signal, skipDebugLog: true });
+    return {
+      ok: res.response.ok,
+      status: res.response.status,
+      latencyMs: res.durationMs,
+      errorDetail: res.response.ok ? undefined : `HTTP ${res.response.status}: ${res.response.statusText}`,
+    };
+  } finally {
+    cleanup();
+  }
+}
 
 /**
  * Health check:
- * - 8000ms AbortSignal.timeout
- * - in-flight guard so checks never overlap
- * - fall back to /v1/health on ANY non-ok result (not only network errors)
- * - Do NOT write heartbeat requests to the debug log
+ * - 8 s timeout per request
+ * - concurrent callers share one in-flight request
+ * - /v1/health fallback exactly once, on ANY failure of /health
+ * - heartbeat requests are not written to the debug log
  */
-export async function checkHealth(
+export function checkHealth(
   profile: HermesServerProfile,
   parentSignal?: AbortSignal
-): Promise<{ ok: boolean; status: number; latencyMs: number; errorDetail?: string }> {
-  if (isHealthCheckInFlight) {
-    return { ok: false, status: 0, latencyMs: 0, errorDetail: 'Health check already in-flight' };
-  }
+): Promise<HealthResult> {
+  const key = `${profile.id}|${profile.baseUrl}`;
+  const existing = healthInFlight.get(key);
+  if (existing) return existing;
 
-  isHealthCheckInFlight = true;
-  const startTime = performance.now();
-
-  try {
-    // 8000ms timeout per requirement 6
-    const { signal, cleanup } = createTimeoutSignal(8000, parentSignal);
+  const run = (async (): Promise<HealthResult> => {
+    const startedAt = performance.now();
+    try {
+      const primary = await probeHealthPath(profile, '/health', parentSignal);
+      if (primary.ok) return primary;
+    } catch {
+      // network error or timeout: fall through to /v1/health
+    }
 
     try {
-      const res = await loggedFetch(profile, '/health', {
-        method: 'GET',
-        signal,
-        skipDebugLog: true, // Do not write heartbeat requests to debug log
-      });
-
-      cleanup();
-
-      if (res.response.ok) {
-        return {
-          ok: true,
-          status: res.response.status,
-          latencyMs: res.durationMs,
-        };
-      }
-
-      // Fall back to /v1/health on ANY non-ok result
-      const fallbackTimeout = createTimeoutSignal(8000, parentSignal);
-      try {
-        const fallbackRes = await loggedFetch(profile, '/v1/health', {
-          method: 'GET',
-          signal: fallbackTimeout.signal,
-          skipDebugLog: true,
-        });
-        fallbackTimeout.cleanup();
-        return {
-          ok: fallbackRes.response.ok,
-          status: fallbackRes.response.status,
-          latencyMs: fallbackRes.durationMs,
-          errorDetail: fallbackRes.response.ok ? undefined : `HTTP ${fallbackRes.response.status}: ${fallbackRes.response.statusText}`,
-        };
-      } catch (fErr) {
-        fallbackTimeout.cleanup();
-        throw fErr;
-      }
-    } catch (primaryErr) {
-      cleanup();
-      // On network error or timeout, attempt fallback /v1/health
-      const fallbackTimeout = createTimeoutSignal(8000, parentSignal);
-      try {
-        const fallbackRes = await loggedFetch(profile, '/v1/health', {
-          method: 'GET',
-          signal: fallbackTimeout.signal,
-          skipDebugLog: true,
-        });
-        fallbackTimeout.cleanup();
-        return {
-          ok: fallbackRes.response.ok,
-          status: fallbackRes.response.status,
-          latencyMs: fallbackRes.durationMs,
-          errorDetail: fallbackRes.response.ok ? undefined : `HTTP ${fallbackRes.response.status}: ${fallbackRes.response.statusText}`,
-        };
-      } catch (fallbackErr) {
-        fallbackTimeout.cleanup();
-        const durationMs = Math.round(performance.now() - startTime);
-        const classified = classifyNetworkError(fallbackErr, buildEndpointUrl(profile.baseUrl, '/v1/health'));
-        return {
-          ok: false,
-          status: classified.statusCode || 0,
-          latencyMs: durationMs,
-          errorDetail: classified.message,
-        };
-      }
+      return await probeHealthPath(profile, '/v1/health', parentSignal);
+    } catch (err) {
+      const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/v1/health'));
+      return {
+        ok: false,
+        status: classified.statusCode || 0,
+        latencyMs: Math.round(performance.now() - startedAt),
+        errorDetail: classified.message,
+      };
     }
+  })().finally(() => {
+    healthInFlight.delete(key);
+  });
+
+  healthInFlight.set(key, run);
+  return run;
+}
+
+/**
+ * /health is public, so a wrong API key still looks "connected".
+ * GET /health/detailed requires the bearer key (HTTP 200 even when degraded):
+ * 401/403 => bad key. 404 => older server, cannot tell, so do not claim failure.
+ */
+export async function checkAuth(
+  profile: HermesServerProfile,
+  parentSignal?: AbortSignal
+): Promise<{ authOk: boolean; status: number; raw?: unknown; errorDetail?: string }> {
+  const { signal, cleanup } = createTimeoutSignal(8000, parentSignal);
+  try {
+    const { response } = await loggedFetch(profile, '/health/detailed', {
+      method: 'GET',
+      signal,
+      skipDebugLog: true,
+    });
+    if (response.status === 401 || response.status === 403) {
+      return { authOk: false, status: response.status, errorDetail: 'API key rejected by server' };
+    }
+    if (response.status === 404) {
+      return { authOk: true, status: 404, errorDetail: '/health/detailed not available on this server' };
+    }
+    if (!response.ok) {
+      return { authOk: false, status: response.status, errorDetail: `HTTP ${response.status}` };
+    }
+    let raw: unknown;
+    try { raw = await response.json(); } catch { raw = undefined; }
+    return { authOk: true, status: response.status, raw };
+  } catch (err) {
+    const classified = classifyNetworkError(err, buildEndpointUrl(profile.baseUrl, '/health/detailed'));
+    return { authOk: false, status: 0, errorDetail: classified.message };
   } finally {
-    isHealthCheckInFlight = false;
+    cleanup();
   }
 }
 
@@ -715,7 +724,6 @@ export async function streamRunEvents({
         },
       });
 
-      // Stream dropped or completed
       if (parseResult.interrupted) {
         if (parseResult.abortReason === 'user_abort') {
           return;
@@ -727,20 +735,26 @@ export async function streamRunEvents({
         }
       }
 
-      // Reconcile via GET /v1/runs/{id} after any drop per requirement 5
+      // Always reconcile after the stream ends for any reason
       const recon = await getRunDetails(profile, runId);
       if (recon.ok && recon.run) {
         onStatusReconciled(recon.run);
-        // If run is completed, failed, cancelled, or interrupted, do not reconnect
         const termStatuses: HermesRunStatus[] = ['completed', 'failed', 'cancelled', 'interrupted'];
         if (termStatuses.includes(recon.run.status)) {
           return;
         }
+        // Not terminal yet: the stream ended early, so reconnect after a short pause
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
       }
 
-      if (parseResult.completedNormally) {
+      // Could not reconcile (network down?): count it as a failed attempt
+      reconnectAttempts++;
+      if (reconnectAttempts > maxReconnectAttempts) {
+        onUIError(`Max reconnect attempts reached (${maxReconnectAttempts}). Stopping stream listener.`);
         return;
       }
+      await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * Math.pow(1.5, reconnectAttempts))));
     } catch (err) {
       if (signal?.aborted) return;
 
