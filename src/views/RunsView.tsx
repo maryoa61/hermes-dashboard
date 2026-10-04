@@ -622,7 +622,7 @@ export const RunsView: React.FC<RunsViewProps> = ({ profile, language, onNavigat
 
       {/* New Run Modal */}
       {showCreateModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
           <div className="w-full max-w-md rounded-2xl bg-[#073642] border border-[#2aa198]/40 p-5 shadow-2xl text-[#eee8d5] space-y-4">
             <h3 className="font-bold text-base flex items-center gap-2">
               <PlayCircle className="w-5 h-5 text-[#ff7b25]" />

@@ -421,7 +421,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
               <span>{t.newChat}</span>
             </button>
           </div>
-          <div className="flex-1 bg-black/50 backdrop-blur-xs" onClick={() => setSidebarOpen(false)} />
+          <div className="flex-1 bg-black/50 backdrop-blur-sm" onClick={() => setSidebarOpen(false)} />
         </div>
       )}
 

@@ -88,7 +88,7 @@ export const PWAInstallBanner: React.FC<PWAInstallBannerProps> = ({ compact = fa
 
       {/* iOS instructions modal */}
       {showIOSGuide && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-2xl bg-[#073642] border border-[#2aa198]/40 p-5 shadow-2xl text-[#eee8d5]">
             <div className="flex items-center justify-between pb-3 border-b border-[#002b36]">
               <h3 className="font-semibold text-base flex items-center gap-2">
